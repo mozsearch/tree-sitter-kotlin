@@ -63,6 +63,22 @@ module.exports = grammar({
     [$.non_nullable_type],
     [$.function_type],
     [$._receiver_type],
+    [$.parenthesized_type],
+    [$.class_modifier, $._soft_keyword_identifier],
+    [$.function_modifier, $._soft_keyword_identifier],
+    [$.function_modifier, $.type_modifiers, $._soft_keyword_identifier],
+    [$.type_modifiers, $._soft_keyword_identifier],
+    [$.visibility_modifier, $._soft_keyword_identifier],
+    [$.inheritance_modifier, $._soft_keyword_identifier],
+    [$.member_modifier, $._soft_keyword_identifier],
+    [$.parameter_modifier, $._soft_keyword_identifier],
+    [$._receiver_type, $._soft_keyword_identifier],
+    [$.type, $._soft_keyword_identifier],
+    [$.type, $._receiver_type, $._soft_keyword_identifier],
+    [$.parameter_modifiers],
+    [$.variance_modifier, $._soft_keyword_identifier],
+    [$.try_expression],
+    [$.if_expression, $.parenthesized_expression],
   ],
 
   extras: $ => [
@@ -85,6 +101,10 @@ module.exports = grammar({
     'set',
     // used to check if we can parse a comment
     '$',
+    // used to check if an explicit backing field can follow a property
+    'field',
+    // between a property and its annotated getter or setter
+    $._accessor_semi,
   ],
 
   inline: $ => [
@@ -115,7 +135,7 @@ module.exports = grammar({
       repeat($.file_annotation),
       optional($.package_header),
       repeat($.import),
-      repeat(seq($.statement, $._semi)),
+      repeat(seq($.statement, $._semicolon)),
     ),
 
     file_annotation: $ => seq(
@@ -126,7 +146,7 @@ module.exports = grammar({
         seq('[', repeat1($._unescaped_annotation), ']'),
         $._unescaped_annotation,
       ),
-      $._semi,
+      $._semicolon,
 
     ),
 
@@ -183,13 +203,23 @@ module.exports = grammar({
       optional(choice(
         seq('=', $.expression),
         $.property_delegate,
+        $.explicit_backing_field,
       )),
       optional(';'),
       optional(choice(
-        seq($.getter, optional($.setter)),
-        seq($.setter, optional($.getter)),
+        seq(optional($._accessor_semi), $.getter, optional(seq(optional($._accessor_semi), $.setter))),
+        seq(optional($._accessor_semi), $.setter, optional(seq(optional($._accessor_semi), $.getter))),
       )),
     )),
+
+    // Kotlin 2's explicit backing fields: `val items: List<Item>` followed by
+    // `field = mutableListOf()`, or `field: MutableList<Item> = ...`.
+    explicit_backing_field: $ => seq(
+      'field',
+      optional(seq(':', $.type)),
+      '=',
+      $.expression,
+    ),
 
     type_alias: $ => prec.right(seq(
       optional($.modifiers),
@@ -221,7 +251,8 @@ module.exports = grammar({
 
     constructor_delegation_call: $ => seq(choice('this', 'super'), $.value_arguments),
 
-    type_parameters: $ => seq('<', commaSep1($.type_parameter), '>'),
+    // (With trailing commas too, here and in type arguments.)
+    type_parameters: $ => seq('<', commaSep1($.type_parameter), optional(','), '>'),
 
     type_parameter: $ => seq(
       optional($.type_parameter_modifiers),
@@ -392,7 +423,7 @@ module.exports = grammar({
 
     class_body: $ => seq(
       '{',
-      repeat(seq($.class_member_declaration, $._class_member_semi)),
+      repeat(seq($.class_member_declaration, $._member_semicolon)),
       '}',
     ),
 
@@ -408,7 +439,7 @@ module.exports = grammar({
       optionalCommaSep1($.enum_entry),
       optional(seq(
         ';',
-        repeat(seq($.class_member_declaration, $._class_member_semi)),
+        repeat(seq($.class_member_declaration, $._member_semicolon)),
       )),
       '}',
     ),
@@ -434,8 +465,8 @@ module.exports = grammar({
 
     _statements: $ => seq(
       $.statement,
-      repeat(seq($._semi, $.statement)),
-      optional($._semi),
+      repeat(seq($._semicolon, $.statement)),
+      optional($._semicolon),
     ),
 
     statement: $ => choice(
@@ -584,7 +615,7 @@ module.exports = grammar({
       ),
     ),
 
-    type_arguments: $ => seq('<', commaSep1($.type_projection), '>'),
+    type_arguments: $ => seq('<', commaSep1($.type_projection), optional(','), '>'),
 
     type_projection: $ => choice(
       seq(repeat($.variance_modifier), $.type),
@@ -605,7 +636,8 @@ module.exports = grammar({
       ')',
     ),
 
-    parenthesized_type: $ => seq('(', $.type, ')'),
+    // (With annotations, ex: `@Composable (() -> Unit)`.)
+    parenthesized_type: $ => seq(optional($.type_modifiers), '(', $.type, ')'),
 
     assignment: $ => seq(
       field('left', $.expression),
@@ -754,7 +786,7 @@ module.exports = grammar({
     lambda_literal: $ => seq(
       '{',
       optional(seq(optional($.lambda_parameters), '->')),
-      optionalSep1($.statement, $._semi),
+      optionalSep1($.statement, $._semicolon),
       '}',
     ),
 
@@ -825,7 +857,8 @@ module.exports = grammar({
 
     parenthesized_expression: $ => seq('(', $.expression, ')'),
 
-    collection_literal: $ => seq('[', commaSep1($.expression), optional(','), ']'),
+    // (Empty ones too, ex: `@Foo(reasons = [])`.)
+    collection_literal: $ => seq('[', optional(seq(commaSep1($.expression), optional(','))), ']'),
 
     when_expression: $ => seq(
       'when',
@@ -855,10 +888,14 @@ module.exports = grammar({
         ),
         'else',
       ),
+      optional($.when_guard),
       '->',
       choice($.block, $.statement),
-      optional($._semi),
+      optional($._semicolon),
     ),
+
+    // Kotlin 2.1's guard conditions: `is Foo if foo.bar ->`, `else if bar ->`.
+    when_guard: $ => seq('if', $.expression),
 
     _when_condition: $ => choice(
       $.expression,
@@ -939,24 +976,33 @@ module.exports = grammar({
       $.class_body,
     ),
 
-    string_literal: $ => seq(
-      '"',
-      repeat(choice(
-        alias(choice(
-          token.immediate(prec(2, seq('\\', /[^bnrt'\"\\\$]/))),
-          token.immediate(prec(1, /[^"\\\$]+/)),
-          '$',
-        ),
-        $.string_content,
-        ),
-        $.escape_sequence,
-        $.interpolation,
-      )),
-      '"',
+    string_literal: $ => choice(
+      seq(
+        '"',
+        repeat(choice(
+          stringContent($),
+          $.escape_sequence,
+          $.interpolation,
+        )),
+        '"',
+      ),
+      // Kotlin 2.1's multi-dollar interpolation: `$$"..."`, whose
+      // interpolations are `$$foo` and `$${...}`, and whose `$`s are text.
+      seq(
+        '$$"',
+        repeat(choice(
+          stringContent($),
+          $.escape_sequence,
+          alias($._multi_dollar_interpolation, $.interpolation),
+        )),
+        '"',
+      ),
     ),
 
     multiline_string_literal: $ => seq(
-      '"""',
+      // (With multi-dollar interpolation too, whose `$$foo`s are a `$` and an
+      // `$foo`, which is the same text.)
+      choice('"""', '$$"""'),
       repeat(choice(
         alias($._multiline_string_content, $.string_content),
         $.interpolation,
@@ -967,6 +1013,11 @@ module.exports = grammar({
     interpolation: $ => choice(
       seq('$', $._identifier),
       seq('${', $.expression, '}'),
+    ),
+
+    _multi_dollar_interpolation: $ => choice(
+      seq('$$', $._identifier),
+      seq('$${', $.expression, '}'),
     ),
 
     character_literal: $ => seq(
@@ -1038,7 +1089,7 @@ module.exports = grammar({
 
     label: _ => token(/[a-zA-Z_][a-zA-Z_0-9]*@/),
 
-    _identifier: $ => choice($.identifier, $._reserved_identifier),
+    _identifier: $ => choice($.identifier, $._reserved_identifier, $._soft_keyword_identifier),
 
     identifier: _ => token(choice(
       /[\p{L}_][\p{L}_\p{Nd}]*/u,
@@ -1063,11 +1114,76 @@ module.exports = grammar({
       $.identifier,
     )),
 
+    // Kotlin's other soft and modifier keywords, which can be names too (ex:
+    // `var private = true`, `suspend { ... }`), but only where nothing else
+    // parses (ex: not `internal` in `@Foo internal class Bar`).
+    _soft_keyword_identifier: $ => prec.dynamic(-1, alias(
+      choice(
+        'abstract',
+        'by',
+        'catch',
+        'companion',
+        'crossinline',
+        'delegate',
+        'dynamic',
+        'external',
+        'field',
+        'file',
+        'final',
+        'finally',
+        'infix',
+        'init',
+        'inline',
+        'internal',
+        'lateinit',
+        'noinline',
+        'open',
+        'out',
+        'override',
+        'param',
+        'private',
+        'property',
+        'protected',
+        'public',
+        'receiver',
+        'reified',
+        'sealed',
+        'setparam',
+        'suspend',
+        'tailrec',
+        'vararg',
+        'where',
+      ),
+      $.identifier,
+    )),
+
+    // Statements' and class members' separators, newlines or `;`s (which the
+    // external scanner decides), aliased, so that `;`s are in trees (as
+    // hidden tokens, their text wasn't).
+    _semicolon: $ => alias($._semi, ';'),
+    _member_semicolon: $ => alias($._class_member_semi, ';'),
+
     shebang: _ => /#!.*/,
 
     line_comment: _ => token(seq('//', /.*/)),
   },
 });
+
+/**
+ * Creates a string literal's text, a `string_content` (a function rather than a
+ * rule, so that its tokens are `string_content`s, rather than its children)
+ *
+ * @param {GrammarSymbols<string>} $
+ *
+ * @returns {AliasRule}
+ */
+function stringContent($) {
+  return alias(choice(
+    token.immediate(prec(2, seq('\\', /[^bnrt'\"\\\$]/))),
+    token.immediate(prec(1, /[^"\\\$]+/)),
+    '$',
+  ), $.string_content);
+}
 
 /**
  * Creates a rule to match one or more of the rules separated by `separator`

@@ -15,6 +15,8 @@ enum TokenType {
     GET,
     SET,
     DOLLAR,
+    FIELD,
+    ACCESSOR_SEMI,
 };
 
 #define MAX_WORD_SIZE 16
@@ -157,7 +159,9 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
         if (!saw_newline) {
             switch (lexer->lookahead) {
                 case '!':
-                    skip(lexer);
+                    // (Advancing, not skipping, so that the `!` is the
+                    // `!is`'s.)
+                    advance(lexer);
                     goto continue_not_is_from_semi;
                 case '?':
                     if (valid_symbols[Q_DOT]) {
@@ -176,7 +180,6 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
         }
 
         char scanned_word[16] = {0};
-    _switch:
         switch (lexer->lookahead) {
             case ',':
             case '.':
@@ -250,16 +253,22 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
                 }
 
                 uint8_t index = -1;
-                bool res = scan_words(
-                    lexer,
-                    (const char[16][16]){"else", "in", "instanceof", "get", "set", "constructor", "by", "as", "where"},
-                    scanned_word, &index);
+                bool res = scan_words(lexer,
+                                      (const char[16][16]){"else", "in", "instanceof", "get", "set", "constructor",
+                                                           "by", "as", "where", "field"},
+                                      scanned_word, &index);
 
                 // If `CLASS_MEMBER_SEMI` is valid, we found a secondary constructor and so we want to insert a semi, OR
                 // we found a variable named constructor whose field is being accessed
                 if (index == 5) {
                     while (iswspace(lexer->lookahead)) {
                         skip(lexer);
+                    }
+                    // A primary constructor on the class's next line (ex:
+                    // `class Foo` followed by `internal constructor(`), if one
+                    // can be there.
+                    if (valid_symbols[CONSTRUCTOR] && lexer->lookahead == '(') {
+                        return false;
                     }
                     if (valid_symbols[CLASS_MEMBER_SEMI] || lexer->lookahead == '.' || lexer->lookahead == '=') {
                         return true;
@@ -307,48 +316,88 @@ bool tree_sitter_kotlin_external_scanner_scan(void *payload, TSLexer *lexer, con
                 else if (index == 1 && valid_symbols[IN]) {
                     return true;
                 }
+                // If `field` was found, don't return a semi only if it can be
+                // an explicit backing field of the preceding property
+                else if (index == 9) {
+                    return !valid_symbols[FIELD];
+                }
                 return !res;
             case ';':
                 advance(lexer);
                 lexer->mark_end(lexer);
                 return true;
-            case '@':
-                if (valid_symbols[CONSTRUCTOR]) {
-                    while (!iswspace(lexer->lookahead)) {
+            case '@': {
+                // Annotations (with arguments, ex: `@VisibleForTesting(otherwise =
+                // PRIVATE)`) and modifiers before a primary constructor on the
+                // class's next line, or before a getter or setter.
+                if (!valid_symbols[CONSTRUCTOR] && !valid_symbols[GET] && !valid_symbols[SET]) {
+                    return true;
+                }
+                while (lexer->lookahead == '@') {
+                    skip(lexer);
+                    while (iswalnum(lexer->lookahead) || lexer->lookahead == '_' || lexer->lookahead == '.' ||
+                           lexer->lookahead == ':') {
                         skip(lexer);
+                    }
+                    if (lexer->lookahead == '(') {
+                        unsigned depth = 0;
+                        do {
+                            if (lexer->lookahead == '(') {
+                                depth++;
+                            } else if (lexer->lookahead == ')') {
+                                depth--;
+                            } else if (lexer->lookahead == '"') {
+                                skip(lexer);
+                                while (lexer->lookahead != '"' && lexer->lookahead != '\n' && !lexer->eof(lexer)) {
+                                    if (lexer->lookahead == '\\') {
+                                        skip(lexer);
+                                    }
+                                    skip(lexer);
+                                }
+                            }
+                            if (lexer->eof(lexer)) {
+                                return true;
+                            }
+                            skip(lexer);
+                        } while (depth > 0);
                     }
                     while (iswspace(lexer->lookahead)) {
                         skip(lexer);
                     }
-                    char ctor[12] = "constructor";
-                    for (uint8_t i = 0; i < 11; i++) {
-                        if (lexer->lookahead != ctor[i]) {
-                            return true;
-                        }
+                }
+                if (lexer->lookahead == '/') {
+                    return true;
+                }
+                while (scan_words(lexer, (const char[16][16]){"public", "private", "protected", "internal"},
+                                  scanned_word, NULL)) {
+                    memset(scanned_word, 0, MAX_WORD_SIZE);
+                    while (iswspace(lexer->lookahead)) {
                         skip(lexer);
+                    }
+                }
+                // (The word after them, if the modifiers' scan didn't read it.)
+                if (!scanned_word[0]) {
+                    for (uint8_t i = 0; i < MAX_WORD_SIZE - 1 && iswalpha(lexer->lookahead); i++) {
+                        scanned_word[i] = (char)lexer->lookahead;
+                        skip(lexer);
+                    }
+                }
+                if (valid_symbols[CONSTRUCTOR] && strncmp(scanned_word, "constructor", MAX_WORD_SIZE) == 0) {
+                    return false;
+                }
+                // (An annotated getter or setter, which the property continues to:
+                // a zero-width `_accessor_semi`, without which a getter's expression
+                // would take a setter's annotations as a trailing lambda's.)
+                if ((strncmp(scanned_word, "get", MAX_WORD_SIZE) == 0 && valid_symbols[GET]) ||
+                    (strncmp(scanned_word, "set", MAX_WORD_SIZE) == 0 && valid_symbols[SET])) {
+                    if (valid_symbols[ACCESSOR_SEMI]) {
+                        lexer->result_symbol = ACCESSOR_SEMI;
+                        return true;
                     }
                     return false;
                 }
-                if (valid_symbols[GET] || valid_symbols[SET]) {
-                    bool saw_paren = false;
-                    while ((saw_paren ? lexer->lookahead != '\n' : !iswspace(lexer->lookahead))) {
-                        skip(lexer);
-                        if (lexer->lookahead == '(') {
-                            saw_paren = true;
-                        }
-                        if (lexer->lookahead == ')') {
-                            saw_paren = false;
-                        }
-                    }
-                    while (iswspace(lexer->lookahead)) {
-                        skip(lexer);
-                    }
-                    if (lexer->lookahead == '/') {
-                        return true;
-                    }
-                    goto _switch;
-                }
                 return true;
+            }
 
             default:
                 return true;
@@ -403,6 +452,9 @@ q_dot_from_semi:
                 lexer->mark_end(lexer);
                 return true;
             }
+            // (Not a block comment starting with the `?`, ex: a nullable
+            // type's before a comment.)
+            return false;
         }
     }
 

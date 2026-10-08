@@ -9,6 +9,27 @@
 
 Kotlin grammar for [tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
+## This fork
+
+This is [searchfox](https://searchfox.org)'s fork of tree-sitter-kotlin-ng
+1.1.0, for its history tokenizer, which tokenizes trees' leaves, and so needs
+all of a file's text to be in its tree, and parses Firefox's Kotlin (all of
+whose 5939 files parse without errors with it, vs 42 with errors, some losing
+thousands of characters to error recovery):
+- `;`s are in trees (aliased statement and member separators, which were
+  hidden), and `!is`'s `!` and nullable types' `?`s before comments are their
+  tokens' (the external scanner skipped them).
+- Soft and modifier keywords can be names (ex: `var private = true`,
+  `suspend { ... }`, `contains(dynamic)`), where nothing else parses.
+- Kotlin 2's multi-dollar interpolation (`$$"..."`), explicit backing fields
+  (`field = ...`), and guard conditions in `when` (`is Foo if bar ->`).
+- Primary constructors on their class's next line (`class Foo` followed by
+  `internal constructor(` or an annotated `constructor(`), annotated getters
+  and setters after properties without types and after getters (with a
+  zero-width `_accessor_semi`), annotated parenthesized types
+  (`@Composable (() -> Unit)`), empty collection literals, and trailing
+  commas in type arguments and parameters.
+
 ## References
 
 - [Kotlin Grammar](https://kotlinlang.org/docs/reference/grammar.html)
